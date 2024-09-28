@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cctype>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <ranges>
@@ -21,13 +22,19 @@ int main(int argc, char* argv[]) {
 		bool show_help = false;
 		std::string input_path;
 		std::string output_path;
+		std::string top_name;
+		std::string internal_prefix = "_";
+		bool ignore_symbols = false;
 	} opt;
 
 	// clang-format off
 	auto cli = (
 		option("-h", "--help")                % "show this message and exit" >> opt.show_help,
 		value("input file",  opt.input_path)  % "input .aag or .aig file to translate",
-		value("output file", opt.output_path) % "output .aag or .aig file to translate"
+		value("output file", opt.output_path) % "output .aag or .aig file to translate",
+		(option("-t", "--top") & value("name", opt.top_name)) % "name for top module, filename by default",
+		(option("-p", "--prefix") & value("prefix", opt.internal_prefix)) % "prefix for unnamed nets",
+		option("-i", "--ignore-symbols")      % "don't use symbol names in the generated verilog" >> opt.ignore_symbols
 	);
 	// clang-format on
 
@@ -48,6 +55,10 @@ int main(int argc, char* argv[]) {
 		return EXIT_FAILURE;
 	}
 
+	const auto path_top =
+	    opt.input_path == "-" ? "top" : std::filesystem::path{opt.input_path}.stem().string();
+	const auto module_name = !opt.top_name.empty() ? opt.top_name : path_top;
+
 	const auto esc = [](const std::string s) {
 		const auto simple = std::all_of(s.begin(), s.end(), [](const char c) {
 			return isalnum(c) || c == '$' || c == '_';
@@ -56,13 +67,16 @@ int main(int argc, char* argv[]) {
 	};
 
 	const auto priv = [&](const auto s, const char* prefix = nullptr) {
-		return fmt::format("__{}{}", prefix ? prefix : "", s);
+		return fmt::format("{}{}{}", opt.internal_prefix, prefix ? prefix : "", s);
 	};
 
 	const auto name_symbs = [&](const auto span, const char* prefix) {
 		for (auto it = span.begin(); it != span.end(); it++) {
-			if (it->name)
-				continue;
+			if (it->name) {
+				if (!opt.ignore_symbols)
+					continue;
+				free(it->name);
+			}
 
 			// Create name symb and allocate memory for it with malloc
 			const auto name = priv(std::distance(span.begin(), it), prefix);
@@ -89,7 +103,7 @@ int main(int argc, char* argv[]) {
 			return esc(input->name);
 		if (auto* latch = aiger_is_latch(aig.get(), lit))
 			return esc(latch->name);
-		return priv(lit, "n");
+		return esc(priv(lit, "n"));
 	};
 
 	const auto rhs = [&](const Aiger::Lit lit) -> std::string {
@@ -202,9 +216,9 @@ initial assume({{ rst }});
 `endif
 endmodule
 )""",
-	    {{"module_name", esc("top")},
-	     {"clk", esc(priv("clk"))},
-	     {"rst", esc(priv("rst"))},
+	    {{"module_name", esc(module_name)},
+	     {"clk", esc("aig2vlog_clk")},
+	     {"rst", esc("aig2vlog_rst")},
 	     {"inputs", transform(Aiger::inputs(aig))},
 	     {"outputs", transform(Aiger::outputs(aig))},
 	     {"latches", transform(Aiger::latches(aig))},
