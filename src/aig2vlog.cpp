@@ -1,32 +1,39 @@
+#include <cassert>
+#include <cctype>
+#include <fstream>
 #include <iostream>
+#include <ranges>
 #include <string>
 #include "aiger++.hpp"
 #include "clipp/clipp.h"
 #include "fmt/core.h"
-#include <cassert>
+#include "inja/inja.hpp"
 
-struct Options {
-	std::string input_path;
-	std::string output_path;
+template <class... Ts>
+struct overloaded : Ts... {
+	using Ts::operator()...;
 };
 
 int main(int argc, char* argv[]) {
 	using namespace clipp;
 
-	Options opt;
-	bool show_help = false;
+	struct Options {
+		bool show_help = false;
+		std::string input_path;
+		std::string output_path;
+	} opt;
 
 	// clang-format off
 	auto cli = (
-		option("-h", "--help")                % "show this message and exit" >> show_help,
+		option("-h", "--help")                % "show this message and exit" >> opt.show_help,
 		value("input file",  opt.input_path)  % "input .aag or .aig file to translate",
 		value("output file", opt.output_path) % "output .aag or .aig file to translate"
 	);
 	// clang-format on
 
-	show_help |= !parse(argc, argv, cli);
+	opt.show_help |= !parse(argc, argv, cli);
 
-	if (show_help) {
+	if (opt.show_help) {
 		const auto format = doc_formatting{}.doc_column(28);
 		std::cout << make_man_page(cli, "aig2vlog", format);
 		return EXIT_FAILURE;
@@ -36,82 +43,173 @@ int main(int argc, char* argv[]) {
 	if (!aig)
 		return EXIT_FAILURE;
 
-	const auto lhs = [](const Aiger::Lit lit) -> std::string {
-		assert(!aiger_is_constant(lit));
-		assert(!aiger_sign(lit));
-		return fmt::format("_n{}", aiger_lit2var(lit));
+	if (aig->num_justice > 0 || aig->num_fairness > 0) {
+		fmt::println(stderr, "ERROR: Justice and Fairness conditions not currently supported");
+		return EXIT_FAILURE;
+	}
+
+	const auto esc = [](const std::string s) {
+		const auto simple = std::all_of(s.begin(), s.end(), [](const char c) {
+			return isalnum(c) || c == '$' || c == '_';
+		});
+		return simple ? s : fmt::format(R"(\{} )", s);
 	};
 
-	const auto rhs = [&lhs](const Aiger::Lit lit) -> std::string {
+	const auto priv = [&](const auto s, const char* prefix = nullptr) {
+		return fmt::format("__{}{}", prefix ? prefix : "", s);
+	};
+
+	const auto name_symbs = [&](const auto span, const char* prefix) {
+		for (auto it = span.begin(); it != span.end(); it++) {
+			if (it->name)
+				continue;
+
+			// Create name symb and allocate memory for it with malloc
+			const auto name = priv(std::distance(span.begin(), it), prefix);
+			char* dst = reinterpret_cast<char*>(malloc(name.size() + 1));
+			assert(dst != NULL);
+			strcpy(dst, name.c_str());
+			it->name = dst;
+		}
+	};
+
+	// Name all symbols corresponding to their type
+	name_symbs(Aiger::inputs(aig), "i");
+	name_symbs(Aiger::outputs(aig), "o");
+	name_symbs(Aiger::latches(aig), "l");
+	name_symbs(Aiger::constraints(aig), "c");
+	name_symbs(Aiger::bads(aig), "b");
+	name_symbs(Aiger::justices(aig), "j");
+	name_symbs(Aiger::fairnesses(aig), "f");
+
+	const auto lhs = [&](const Aiger::Lit lit) -> std::string {
+		assert(!aiger_is_constant(lit));
+		assert(!aiger_sign(lit));
+		if (auto* input = aiger_is_input(aig.get(), lit))
+			return esc(input->name);
+		if (auto* latch = aiger_is_latch(aig.get(), lit))
+			return esc(latch->name);
+		return priv(lit, "n");
+	};
+
+	const auto rhs = [&](const Aiger::Lit lit) -> std::string {
 		if (aiger_is_constant(lit))
-			return lit == aiger_false ? "1'b0" : "1'b1";
+			return lit == aiger_true ? "1'b1" : "1'b0";
 		return fmt::format("{}{}", aiger_sign(lit) ? "~" : "", lhs(aiger_strip(lit)));
 	};
 
-	fmt::println(R"(module top()");
+	const auto to_json = overloaded{
+	    [&](const aiger_symbol& symb) -> inja::json {
+		    assert(symb.name);
+		    inja::json json{
+		        {"lit", rhs(symb.lit)},
+		        {"next", rhs(symb.next)},
+		        {"prop_prefix", fmt::format("{}: ", symb.name)},
+		        {"name", esc(symb.name)}
+		    };
 
-	const auto net_name = [](const size_t idx, const char* name, const char prefix) -> std::string {
-		if (name == nullptr)
-			return fmt::format("_{}{}", prefix, idx);
-		return fmt::format(R"(\{} )", name);
+		    if (symb.reset != symb.next)
+			    json["reset"] = rhs(symb.reset);
+
+		    return json;
+	    },
+	    [&](const aiger_and& gate) -> inja::json {
+		    return {
+		        {"lhs", lhs(gate.lhs)},
+		        {"rhs0", rhs(gate.rhs0)},
+		        {"rhs1", rhs(gate.rhs1)},
+		    };
+	    }
 	};
 
-	for (size_t i = 0; i < aig->num_inputs; i++)
-		fmt::println("\tinput wire {},", net_name(i, aig->inputs[i].name, 'i'));
-	for (size_t i = 0; i < aig->num_outputs; i++)
-		fmt::println("\toutput wire {},", net_name(i, aig->outputs[i].name, 'o'));
-	fmt::println("\tinput wire clk,");
-	fmt::println("\tinput wire rst");
-	fmt::println(");");
-
-	// Connect inputs to internal wires
-	for (size_t i = 0; i < aig->num_inputs; i++)
-		fmt::println("wire {} = {};", lhs(aig->inputs[i].lit),net_name(i, aig->inputs[i].name, 'i'));
-
-	// Declare all registers
-	for (size_t i = 0; i < aig->num_latches; i++) {
-		const auto& latch = aig->latches[i];
-		const auto name = net_name(i, latch.name, 'l');
-		fmt::println("reg {}; wire {} = {};", name, lhs(latch.lit), name);
-	}
-
-	// Comb gates
-	for (const auto& gate : Aiger::gates(aig))
-		fmt::println("wire {} = {} & {};", lhs(gate.lhs), rhs(gate.rhs0), rhs(gate.rhs1));
-
-	fmt::println("always @(posedge clk) begin");
-	for (size_t i = 0; i < aig->num_latches; i++)
-		fmt::println("\t{} <= {};", net_name(i, aig->latches[i].name, 'l'), rhs(aig->latches[i].next));
-	fmt::println("\tif (rst) begin");
-	for (size_t i = 0; i < aig->num_latches; i++) {
-		const auto& latch = aig->latches[i];
-		if (latch.reset != latch.lit)
-			fmt::println("\t\t{} <= {};", net_name(i, aig->latches[i].name, 'l'), rhs(latch.reset));
-	}
-	fmt::println("\tend");
-	fmt::println("end");
-
-	const auto prop_name = [](const char* name) -> std::string {
-		if (name == nullptr)
-			return "";
-		else
-			return fmt::format("{}: ", name);
+	const auto transform = [&](const auto symb_it) -> std::vector<inja::json> {
+		const auto transformed = symb_it | std::views::transform(to_json);
+		return {transformed.begin(), transformed.end()};
 	};
 
-	// Connect internal wires to outputs
-	for (size_t i = 0; i < aig->num_outputs; i++)
-		fmt::println("assign {} = {};", net_name(i, aig->outputs[i].name, 'i'), rhs(aig->outputs[i].lit));
+	std::ofstream output_file;
+	std::ostream* output_stream = &std::cout;
+	if (opt.output_path != "-") {
+		output_file.open(opt.output_path);
+		output_stream = &output_file;
+	}
 
-	fmt::println("always @* begin");
-	fmt::println("\tif (!rst) begin");
-	for (const auto& constraint : Aiger::constraints(aig))
-		fmt::println("\t\t{}assume({});", prop_name(constraint.name), rhs(constraint.lit));
-	for (const auto& bad: Aiger::bads(aig))
-		fmt::println("\t\t{}assert({});", prop_name(bad.name), rhs(aiger_not(bad.lit)));
-	assert(aig->num_justice == 0);
-	assert(aig->num_fairness == 0);
-	fmt::println("\tend");
-	fmt::println("end");
+	inja::render_to(
+	    *output_stream, R"""(
+// AUTOGENERATED WITH aig2vlog!!!
 
-	fmt::println("endmodule");
+module {{ module_name }}(
+## for input in inputs
+	input wire {{ input.name }},
+## endfor
+## for output in outputs
+	output wire {{ output.name }},
+## endfor
+	input wire {{ clk }},
+	input wire {{ rst }}
+);
+
+// Latch declarations
+## for latch in latches
+reg {{ latch.lit }};
+## endfor
+
+// AND gates
+## for gate in gates
+wire {{ gate.lhs }} = {{ gate.rhs0 }} & {{ gate.rhs1 }};
+## endfor
+
+// Latch definitions
+always @(posedge {{ clk }}) begin
+## for latch in latches
+	{{ latch.lit }} <= {{ latch.next }};
+## endfor
+	if ({{ rst }}) begin
+## for latch in latches
+{% if existsIn(latch, "reset") %}		{{ latch.lit }} <= {{ latch.reset }};
+{% endif -%}
+## endfor
+	end
+end
+
+// Assign outputs
+## for output in outputs
+	assign {{ output.name }} = {{ output.lit }};
+## endfor
+
+always @* begin
+	if (~{{ rst }}) begin
+		// Constraints
+## for constraint in constraints
+		{{ constraint.prop_prefix }}assume({{ constraint.lit }});
+## endfor
+
+		// Safety properties (bad)
+## for assert in asserts
+		{{ assert.prop_prefix }}assert(~{{ assert.lit }});
+## endfor
+	end
+end
+
+`ifdef YOSYS
+`ifdef FORMAL
+`define INITIAL_ASSUME_RESET
+`endif
+`endif
+
+`ifdef INITIAL_ASSUME_RESET
+initial assume({{ rst }});
+`endif
+endmodule
+)""",
+	    {{"module_name", esc("top")},
+	     {"clk", esc(priv("clk"))},
+	     {"rst", esc(priv("rst"))},
+	     {"inputs", transform(Aiger::inputs(aig))},
+	     {"outputs", transform(Aiger::outputs(aig))},
+	     {"latches", transform(Aiger::latches(aig))},
+	     {"gates", transform(Aiger::gates(aig))},
+	     {"constraints", transform(Aiger::constraints(aig))},
+	     {"asserts", transform(Aiger::bads(aig))}}
+	);
 }

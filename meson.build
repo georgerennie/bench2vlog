@@ -18,10 +18,12 @@ subdir('libs')
 aiger_proj = subproject('aiger', default_options: ['default_library=static'])
 aiger = aiger_proj.get_variable('aiger')
 
+inja = subproject('inja').get_variable('inja_dep')
+
 fmt = dependency('fmt', required: true)
 
 executable('aig2vlog',
   'src/aig2vlog.cpp',
-  dependencies: [aiger, fmt, clipp],
+  dependencies: [aiger, fmt, clipp, inja],
   install: true
 )

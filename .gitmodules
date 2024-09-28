@@ -1,3 +1,6 @@
 [submodule "subprojects/aiger"]
 	path = subprojects/aiger
 	url = git@github.com:georgerennie/aiger.git
+[submodule "subprojects/inja"]
+	path = subprojects/inja
+	url = git@github.com:pantor/inja.git
