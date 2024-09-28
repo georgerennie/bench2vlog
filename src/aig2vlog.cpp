@@ -169,8 +169,12 @@ reg {{ latch.lit }};
 ## endfor
 
 // AND gates
+{# declare gate wires before defining in case they are not topo sorted #}
 ## for gate in gates
-wire {{ gate.lhs }} = {{ gate.rhs0 }} & {{ gate.rhs1 }};
+wire {{ gate.lhs }};
+## endfor
+## for gate in gates
+assign {{ gate.lhs }} = {{ gate.rhs0 }} & {{ gate.rhs1 }};
 ## endfor
 
 // Latch definitions
